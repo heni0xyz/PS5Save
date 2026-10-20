@@ -40,6 +40,9 @@ daily_snapshots_to_keep=3
 # PS5SX3
 /data/homebrew/PPSA99303/rpcs3/dev_hdd0/home/
 
+# Porpoise
+/data/porpoise/saves/
+
 # ProsperoEden
 /data/prosperoeden/user/nand
 ```
