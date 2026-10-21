@@ -13,7 +13,7 @@ Easy to use USB save backup utility for jailbroken PS5s that helps you prevent d
 - Plug in into your PS5
 - Push the backup.elf payload to your PS5 using a network loader or an autoloader of your choice
 
-PS4/PS5 saves will not be backed up while in-game as mounting them can lead to corruption; a better solution will come in a later release 
+PS4/PS5 saves will backed up while in-game except for the game you're currently playing it will be backed up after you exit the title *(since version v2)*
 
 # Backup Configuration
 Example: 
@@ -75,7 +75,7 @@ export PS5_PAYLOAD_SDK="$(pwd)/ps5-payload-sdk"
 export LLVM_CONFIG=llvm-config-18
 ```
 
-Open the PS5Save source directory containing `Makefile`, `main.c`, `notification_icon.h` and `backup_progress.h`, then run:
+Open the PS5Save source directory, then run:
 
 ```sh
 make
