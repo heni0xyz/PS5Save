@@ -75,7 +75,7 @@ export PS5_PAYLOAD_SDK="$(pwd)/ps5-payload-sdk"
 export LLVM_CONFIG=llvm-config-18
 ```
 
-Open the PS5Save source directory containing `Makefile`, `main.c`, `notification_icon.h` and `backup_progress.h`, then run:
+Open the PS5Save source directory, then run:
 
 ```sh
 make
