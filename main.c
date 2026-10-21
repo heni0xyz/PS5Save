@@ -22,7 +22,7 @@ along with this program; see the file COPYING. If not, see
  *
  *   /data/PCSX2/Mcd001.ps2        one file
  *   /data/porpoise/saves/<star>   every file and folder below, recursively
- *   backup_interval_seconds=600     seconds between backups (default 600)
+ *   backup_interval_seconds=60      seconds between backups (default 60)
  *   backup_ps4_saves=true           enable decrypted PS4 saves (default false)
  *   backup_ps5_saves=true           enable decrypted PS5 saves (default false)
  *   max_title_size_mb=4096          size limit for all save images of one title
@@ -46,9 +46,10 @@ along with this program; see the file COPYING. If not, see
  * PS4/PS5 saves are encrypted images. For each image that changed, a COPY of
  * the image is mounted (the original is only ever read), the decrypted files
  * are copied to /mnt/usb0/backup/saves/..., and the image is unmounted again.
- * Images are NEVER mounted while any game/app is running or suspended in the
- * background; the check is repeated before the mount and while copying, and
- * the image is unmounted at once if a game shows up.
+ * A title is deferred while that same title is running, suspended or still
+ * sandbox-mounted. Other titles may be backed up during gameplay. Activity is
+ * checked before mounting and during copying; unknown activity fails closed.
+ * Deferred titles are retried after closure, independently of the interval.
  *
  * Save mounting is based on the Playstation-5-Save-Mounter payload by n0llptr
  * (GPLv3), which in turn builds on research by cow and the garlic-savemgr
@@ -129,7 +130,7 @@ along with this program; see the file COPYING. If not, see
 #define SPACE_MARGIN  (64ULL * 1024ULL * 1024ULL)
 #define COPY_BUF_SZ   (1024 * 1024)
 
-#define DEF_INTERVAL  600     /* seconds between backups */
+#define DEF_INTERVAL  60      /* seconds between backups */
 #ifndef MIN_INTERVAL
 #define MIN_INTERVAL  30
 #endif
@@ -146,7 +147,6 @@ along with this program; see the file COPYING. If not, see
 #ifndef GAME_CHECK_SEC
 #define GAME_CHECK_SEC 1.0    /* how often the game check is repeated while mounted */
 #endif
-#define FORCE_SEC     (6 * 3600)  /* re-check an unchanged image at least this often */
 #define SAVE_AUTHID   0x4800000000000010ULL
 
 
@@ -163,6 +163,8 @@ int sceNotificationSend(int user_id, bool is_logged, const char *payload);
 #define NOTIFICATION_ICON_DIR "/user/data/ps5save"
 #endif
 #define NOTIFICATION_ICON_PATH NOTIFICATION_ICON_DIR "/notification.png"
+
+static const char PS5SAVE_VERSION[] = "v2";
 
 static int mkdir_p(const char *path);
 
@@ -213,14 +215,16 @@ prepare_notification_icon(void) {
 
 
 
-/* app info of a process, as used by the SDK "ps" sample */
+/* App-info ABI used by kstuff-lite and ShadowMountPlus. The title starts at
+ * 0x10: inserting an app_type field here shifts every title by four bytes.
+ * https://github.com/EchoStretch/kstuff-lite/blob/main/ps5-kstuff-ldr/src/shellui_patch.c */
 typedef struct app_info {
   uint32_t app_id;
   uint64_t unknown1;
-  uint32_t app_type;
-  char     title_id[10];
+  char     title_id[14];
   char     unknown2[0x3c];
 } app_info_t;
+_Static_assert(offsetof(app_info_t, title_id) == 0x10, "Incorrect app-info title offset");
 
 int sceKernelGetAppInfo(pid_t pid, app_info_t *info);
 
@@ -267,11 +271,10 @@ static int g_ps4saves = 0;
 static int g_ps5saves = 0;
 static int g_need_cleanup = 1;
 static int g_mount_stuck = 0;
-static int g_watch_game = 0;      /* check for games while copying */
-static int g_game_abort = 0;      /* stop PS4/PS5 save-image work only */
+static int g_watch_game = 0;      /* protect the currently mounted title */
+static int g_game_abort = 0;      /* abort this save image only */
 static int g_backup_busy = 0;     /* one activity warning per copying pass */
 static int g_start_notified = 0;  /* one startup notification per process */
-static int g_game_notified = 0;
 static double g_last_watch = 0;
 static char g_abort_why[192];
 
@@ -337,9 +340,9 @@ build_notification_payload(const char *message, const char *created_at,
         "\"icon\":{\"type\":\"Url\",\"parameters\":{"
           "\"url\":\"" NOTIFICATION_ICON_PATH "\"}},"
         "\"message\":{\"body\":\"%s\"},"
-        "\"subMessage\":{\"body\":\"PS5Save\"}}},"
+        "\"subMessage\":{\"body\":\"PS5Save | Version %s\"}}},"
       "\"createdDateTime\":\"%s\",\"localNotificationId\":\"%s\"}",
-    escaped, created_at, id);
+    escaped, PS5SAVE_VERSION, created_at, id);
   free(escaped);
   return n >= 0 && (size_t)n < size;
 }
@@ -565,6 +568,8 @@ fs_free(const char *path, const char *test_env) {
 /**
  * Total size of all regular files below path.
  **/
+static void game_watch(void);
+
 static uint64_t
 dir_size(const char *path) {
   char sub[PATH_MAX];
@@ -577,6 +582,8 @@ dir_size(const char *path) {
     return 0;
   }
   while((dp = readdir(dir))) {
+    game_watch();
+    if(g_watch_game && g_game_abort) break;
     if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) {
       continue;
     }
@@ -599,122 +606,11 @@ dir_size(const char *path) {
  * Game detection
  * ---------------------------------------------------------------------- */
 
-#ifndef BACKUP_HOST_TEST
-
-/**
- * Returns non-zero if a game/app is running or suspended in the background,
- * OR if that could not be determined (fail safe). The reason is stored in
- * why. Two independent signals are used:
- *   1. any process (other than this one) that belongs to an application with
- *      a title id that is not a system app (NPXS*), which also covers games
- *      that are suspended in the background, and
- *   2. any game sandbox (/mnt/sandbox/CUSA* or PPSA*) in the mount table.
- **/
-static int
-detect_game(char *why, size_t len) {
-  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
-  pid_t me = getpid();
-  struct statfs *mnts = NULL;
-  size_t sz = 0;
-  char *buf = NULL;
-  int ok = 0;
-  int n;
-
-  for(int attempt = 0; attempt < 4 && !ok; attempt++) {
-    if(sysctl(mib, 4, NULL, &sz, NULL, 0) || sz == 0) {
-      break;
-    }
-    sz += 64 * sizeof(struct kinfo_proc); /* processes started meanwhile */
-    free(buf);
-    if(!(buf = malloc(sz))) {
-      break;
-    }
-    if(!sysctl(mib, 4, buf, &sz, NULL, 0)) {
-      ok = 1;
-    } else if(errno != ENOMEM) {
-      break;
-    }
-  }
-
-  if(!ok) {
-    free(buf);
-    snprintf(why, len, "cannot read process list");
-    return 1;
-  }
-
-  for(char *p = buf; p < buf + sz;) {
-    struct kinfo_proc *ki = (struct kinfo_proc*)p;
-    app_info_t ai;
-    char tid[11];
-
-    if(ki->ki_structsize <= 0) {
-      break;
-    }
-    p += ki->ki_structsize;
-
-    if(ki->ki_pid == me) {
-      continue;
-    }
-
-    memset(&ai, 0, sizeof ai);
-    if(sceKernelGetAppInfo(ki->ki_pid, &ai)) {
-      continue;
-    }
-
-    memcpy(tid, ai.title_id, 10);
-    tid[10] = 0;
-    if(isalpha((unsigned char)tid[0]) && strncmp(tid, "NPXS", 4)) {
-      snprintf(why, len, "%s is running (pid %d, %s)", tid, (int)ki->ki_pid,
-               ki->ki_comm);
-      free(buf);
-      return 1;
-    }
-  }
-  free(buf);
-
-  n = getmntinfo(&mnts, MNT_NOWAIT);
-  if(n <= 0 || !mnts) {
-    snprintf(why, len, "cannot read mount table");
-    return 1;
-  }
-  for(int i = 0; i < n; i++) {
-    if(strstr(mnts[i].f_mntonname, "/mnt/sandbox/") &&
-       (strstr(mnts[i].f_mntonname, "CUSA") ||
-        strstr(mnts[i].f_mntonname, "PPSA"))) {
-      snprintf(why, len, "game sandbox mounted (%s)", mnts[i].f_mntonname);
-      return 1;
-    }
-  }
-
-  return 0;
-}
-
-#else /* BACKUP_HOST_TEST: scripted game state for the host test */
-
-static int g_det_calls;
-
-static int
-detect_game(char *why, size_t len) {
-  const char *file = getenv("TEST_GAME_FILE");
-  const char *after = getenv("TEST_GAME_AFTER");
-
-  g_det_calls++;
-  if(after && g_det_calls > atoi(after)) {
-    snprintf(why, len, "TESTGAME is running (appeared mid-copy)");
-    return 1;
-  }
-  if(file && !access(file, F_OK)) {
-    snprintf(why, len, "TESTGAME is running (pid 1, test)");
-    return 1;
-  }
-  return 0;
-}
-
-#endif
+#include "title_activity.h"
 
 
 /**
- * Called regularly while an image is copied or mounted. If a game shows up,
+ * Called regularly while an image is copied or mounted. If its title appears,
  * g_game_abort is set and save-image copy loops stop as soon as possible.
  * Ordinary configured files are independent of game detection.
  **/
@@ -733,11 +629,14 @@ game_watch(void) {
   }
   g_last_watch = t;
 
-  if(detect_game(why, sizeof why)) {
+  if(title_blocked(g_watch_title, why, sizeof why, 0)) {
     g_game_abort = 1;
     snprintf(g_abort_why, sizeof g_abort_why, "%s", why);
   }
 }
+
+
+#include "change_index.h"
 
 
 /* ------------------------------------------------------------------------
@@ -755,7 +654,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   char tmp[PATH_MAX];
   char dir[PATH_MAX];
   const char *label = dst + strlen(BACKUP_ROOT);
-  struct stat dst_st;
+  struct stat after;
   struct timeval tv[2];
   char *slash;
   ssize_t n;
@@ -768,8 +667,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
   int progress_started = 0;
   if(g_progress_planning) {
     if((!g_file_cap || (uint64_t)st->st_size <= g_file_cap) &&
-       (stat(dst, &dst_st) || dst_st.st_size != st->st_size ||
-        llabs((long long)dst_st.st_mtime - (long long)st->st_mtime) > 2))
+       !file_current(dst, st))
       progress_plan(1);
     return;
   }
@@ -795,9 +693,8 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     goto done;
   }
 
-  /* already backed up and unchanged (FAT stores mtime with 2s resolution) */
-  if(!stat(dst, &dst_st) && dst_st.st_size == st->st_size &&
-     llabs((long long)dst_st.st_mtime - (long long)st->st_mtime) <= 2) {
+  /* Exact source and destination metadata cached after a successful copy. */
+  if(file_current(dst, st)) {
     stats->unchanged++;
     if(g_progress_image) progress_advance(st->st_size);
     return;
@@ -844,7 +741,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
       p += w;
       n -= w;
     }
-    if(++reads % 8 == 0) {
+    if(++reads) {
       game_watch();
       if(g_watch_game && g_game_abort) {
         aborted = 1;
@@ -856,6 +753,10 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     goto done;
   }
 
+  if(fstat(in, &after) || !source_same(st, &after)) {
+    logq("Source changed during copy: %s", src);
+    goto done;
+  }
   if(fsync(out)) {
     goto done;
   }
@@ -875,6 +776,7 @@ backup_file(const char *src, const char *dst, const struct stat *st,
     goto done;
   }
 
+  index_update(dst, st);
   ok = 1;
 
 done:
@@ -1064,7 +966,7 @@ copy_plain(const char *src, const char *dst) {
       p += w;
       n -= w;
     }
-    if(++reads % 8 == 0) {
+    if(++reads) {
       game_watch();
       if(g_game_abort) {
         rc = -2;
@@ -1160,38 +1062,32 @@ cleanup_stale(void) {
 static int
 stamp_current(const char *dst_dir, const struct stat *img) {
   char path[PATH_MAX];
-  struct stat ss;
-  long long size;
-  long long mtime;
-  FILE *f;
-  int ok;
-
+  file_signature_t stored, current = file_signature(img);
   snprintf(path, sizeof path, "%s/.image_stamp", dst_dir);
-  if(stat(path, &ss) || wall_clock() - ss.st_mtime > FORCE_SEC) {
-    return 0;
-  }
-  if(!(f = fopen(path, "r"))) {
-    return 0;
-  }
-  ok = fscanf(f, "%lld %lld", &size, &mtime) == 2 &&
-       size == (long long)img->st_size && mtime == (long long)img->st_mtime;
+  FILE *f = fopen(path, "rb");
+  if(!f) return 0;
+  char magic[8];
+  int ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "PS5IMG2\n", 8) &&
+           fread(&stored, 1, sizeof stored, f) == sizeof stored &&
+           !memcmp(&stored, &current, sizeof stored);
   fclose(f);
   return ok;
 }
 
-
 static void
 stamp_write(const char *dst_dir, const struct stat *img) {
-  char path[PATH_MAX];
-  FILE *f;
-
+  char path[PATH_MAX], part[PATH_MAX];
+  file_signature_t sig = file_signature(img);
   mkdir_p(dst_dir);
   snprintf(path, sizeof path, "%s/.image_stamp", dst_dir);
-  if((f = fopen(path, "w"))) {
-    fprintf(f, "%lld %lld\n", (long long)img->st_size,
-            (long long)img->st_mtime);
-    fclose(f);
-  }
+  snprintf(part, sizeof part, "%s.part", path);
+  FILE *f = fopen(part, "wb");
+  if(!f) return;
+  int ok = fwrite("PS5IMG2\n", 1, 8, f) == 8 &&
+           fwrite(&sig, 1, sizeof sig, f) == sizeof sig;
+  if(fflush(f) || fsync(fileno(f))) ok = 0;
+  if(fclose(f)) ok = 0;
+  if(!ok || rename(part, path)) unlink(part);
 }
 
 
@@ -1210,12 +1106,15 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   const char *save = name;
   sv_result_t result = SV_FAILED;
   unsigned failed_before;
-  struct stat ist;
+  struct stat ist, after;
   MountOpt mopt;
   int mounted = 0;
   int have_tmp = 0;
   int ret;
   int fd;
+
+  g_game_abort = 0;
+  snprintf(g_watch_title, sizeof g_watch_title, "%s", title);
 
   if(!strncmp(save, "sdimg_", 6)) {
     save += 6;
@@ -1242,22 +1141,15 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
     return SV_FAILED;
   }
 
-  /* re-check the USB drive right before this image (earlier images of the
-   * same game may have used space meanwhile) */
-  {
-    uint64_t existing = dir_size(dst_dir);
-    uint64_t need = (uint64_t)ist.st_size > existing ?
-                    (uint64_t)ist.st_size - existing : 0;
-
-    if(usb_free() < need + SPACE_MARGIN) {
-      logq("Failed to backup %s (not enough space on USB)", label);
-      stats->failed++;
-      return SV_FAILED;
-    }
+  /* Use the image size as a conservative bound; do not rescan the USB tree. */
+  if(usb_free() < (uint64_t)ist.st_size + SPACE_MARGIN) {
+    logq("Failed to backup %s (not enough space on USB)", label);
+    stats->failed++;
+    return SV_FAILED;
   }
 
-  /* never touch a save while a game is running or suspended */
-  if(detect_game(why, sizeof why)) {
+  /* Never stage/mount this title while it is running or suspended. */
+  if(title_blocked(title, why, sizeof why, 1)) {
     g_game_abort = 1;
     snprintf(g_abort_why, sizeof g_abort_why, "%s", why);
     return SV_GAME;
@@ -1310,11 +1202,16 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   }
 
   /* last check right before the mount */
-  if(detect_game(why, sizeof why)) {
+  if(title_blocked(title, why, sizeof why, 1)) {
     g_game_abort = 1;
     snprintf(g_abort_why, sizeof g_abort_why, "%s", why);
     result = SV_GAME;
     goto cleanup;
+  }
+
+  if(stat(image, &after) || !source_same(&ist, &after)) {
+    logq("Save image changed while staging: %s", label);
+    goto fail_cleanup;
   }
 
   if(decrypt_key(sealed, key)) {
@@ -1330,6 +1227,12 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   sceFsInitMountSaveDataOpt(&mopt);
   mopt.budgetid = "system";
 
+  if(title_blocked(title, why, sizeof why, 1)) {
+    g_game_abort = 1;
+    snprintf(g_abort_why, sizeof g_abort_why, "%s", why);
+    result = SV_GAME;
+    goto cleanup;
+  }
   if(sceFsMountSaveData(&mopt, TMP_IMG, MOUNT_POINT, key) < 0) {
     rmdir(MOUNT_POINT);
     goto fail_cleanup;
@@ -1342,8 +1245,12 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   backup_tree(MOUNT_POINT, dst_dir, stats);
   g_file_cap = MAX_FILE_SZ;
 
+  game_watch();
+  if(title_blocked(title, why, sizeof why, 1)) g_game_abort = 1;
   if(g_game_abort) {
     result = SV_GAME;
+  } else if(stat(image, &after) || !source_same(&ist, &after)) {
+    logq("Save image changed during backup: %s", label);
   } else if(stats->failed == failed_before) {
     result = SV_OK;
   }
@@ -1443,7 +1350,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     return;
   }
 
-  while((td = readdir(bd)) && !g_game_abort && !g_mount_stuck) {
+  while((td = readdir(bd)) && !g_mount_stuck) {
     char tdir[PATH_MAX];
     char tlabel[PATH_MAX];
     char dst_dir[PATH_MAX];
@@ -1452,7 +1359,6 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     char b[32];
     uint64_t total = 0;       /* all images of the game */
     uint64_t need_total = 0;  /* images that must be backed up now */
-    uint64_t existing = 0;    /* what their previous backups already occupy */
     uint64_t max_need = 0;
     uint64_t required;
     int n = 0;
@@ -1468,6 +1374,12 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     if(snprintf(tdir, sizeof tdir, "%s/%s", base, td->d_name) >= (int)sizeof tdir ||
        stat(tdir, &st) || !S_ISDIR(st.st_mode)) {
       continue;
+    }
+    pending_title_t *queued = pending_find(uid, td->d_name, ps5);
+    if(g_pending_only && (!queued || !queued->ready)) continue;
+    if(!g_progress_planning && queued) {
+      queued->ready = 0;
+      queued->retry_at = now_seconds() + g_interval;
     }
     if(!(id = opendir(tdir))) {
       continue;
@@ -1503,7 +1415,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
       if(imgs[n].needed) {
         needed++;
         need_total += st.st_size;
-        existing += dir_size(dst_dir);
+        /* Image size bounds decrypted data without walking the USB tree. */
         if((uint64_t)st.st_size > max_need) {
           max_need = st.st_size;
         }
@@ -1539,7 +1451,15 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
     }
 
     if(!needed) {
+      pending_remove(uid, td->d_name, ps5);
       stats->unchanged += n;
+      continue;
+    }
+
+    char why[160];
+    if(title_blocked(td->d_name, why, sizeof why, 1)) {
+      pending_defer(uid, td->d_name, ps5);
+      logq("Deferred %s: %s", td->d_name, why);
       continue;
     }
 
@@ -1559,7 +1479,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
 
     /* 3. the USB drive must be able to hold everything that is going to be
      * written (image sizes are an upper bound of the decrypted content) */
-    required = (need_total > existing ? need_total - existing : 0) + SPACE_MARGIN;
+    required = need_total + SPACE_MARGIN;
     if(usb_free() < required) {
       snprintf(key, sizeof key, "usb:%s", tlabel);
       if(!seen_before(key)) {
@@ -1573,14 +1493,23 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
       continue;
     }
 
-    /* pass 2: back up the whole game */
-    for(int i = 0; i < n && !g_game_abort && !g_mount_stuck; i++) {
+    /* pass 2: back up only this safe title; other titles remain independent. */
+    int complete = 1;
+    for(int i = 0; i < n && !g_mount_stuck; i++) {
       if(!imgs[i].needed) {
         stats->unchanged++;
         continue;
       }
-      backup_save_image(uid, td->d_name, tdir, imgs[i].name, ps5, stats);
+      sv_result_t result = backup_save_image(uid, td->d_name, tdir, imgs[i].name, ps5, stats);
+      if(result == SV_GAME) {
+        pending_defer(uid, td->d_name, ps5);
+        complete = 0;
+        break;
+      }
+      if(result == SV_FAILED) complete = 0;
     }
+    g_game_abort = 0;
+    if(complete) pending_remove(uid, td->d_name, ps5);
   }
 
   free(imgs);
@@ -1611,14 +1540,14 @@ backup_saves(backup_stats_t *stats) {
   }
 
   if((hd = opendir(HOME_ROOT))) {
-    while((ud = readdir(hd)) && !g_game_abort && !g_mount_stuck) {
+    while((ud = readdir(hd)) && !g_mount_stuck) {
       if(!is_hex_name(ud->d_name)) {
         continue;
       }
       if(g_ps4saves) {
         scan_saves(ud->d_name, 0, stats);
       }
-      if(g_ps5saves && !g_game_abort && !g_mount_stuck) {
+      if(g_ps5saves && !g_mount_stuck) {
         scan_saves(ud->d_name, 1, stats);
       }
     }
@@ -1728,6 +1657,8 @@ backup_entry(char *line, backup_stats_t *stats) {
     parse_bool(value, &g_ps5saves);
     return;
   }
+
+  if(g_pending_only) return;
 
   /* only absolute paths are valid entries */
   if(line[0] != '/') {
@@ -1969,7 +1900,8 @@ copy_tree(const char *src, const char *dst, uint64_t *bytes) {
     if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) {
       continue;
     }
-    if(!strcmp(dp->d_name, ".image_stamp") ||
+    if(!strcmp(dp->d_name, ".ps5save-index") ||
+       !strcmp(dp->d_name, ".image_stamp") ||
        (len > 5 && !strcmp(dp->d_name + len - 5, ".part"))) {
       continue;
     }
@@ -2149,20 +2081,18 @@ daily_check(void) {
  * local midnight if that comes first (so the new day's snapshot is made
  * promptly).
  **/
-static time_t
-next_due(void) {
-  time_t now = wall_clock();
-  time_t due = now + g_interval;
-
+static double
+next_due(double started) {
+  double due = started + g_interval;
   if(g_daily > 0) {
     clock_info_t ci;
-
-    local_clock(now, &ci);
-    if(now + ci.to_midnight + 1 < due) {
-      due = now + ci.to_midnight + 1;
-    }
+    local_clock(wall_clock(), &ci);
+    double midnight = now_seconds() + ci.to_midnight + 1;
+    if(midnight < due) due = midnight;
   }
-  return due;
+  /* Long passes never overlap or generate a catch-up burst. */
+  double now = now_seconds();
+  return due > now ? due : now + g_interval;
 }
 
 
@@ -2170,7 +2100,7 @@ next_due(void) {
  * Run one backup pass. Returns -1 if backup.conf could not be opened.
  **/
 static int
-run_cycle(void) {
+run_cycle(int pending_only) {
   backup_stats_t stats;
   char line[PATH_MAX + 16];
   char size[32];
@@ -2187,6 +2117,9 @@ run_cycle(void) {
   }
 
   progress_reset();
+  index_load();
+  g_pending_only = pending_only;
+  g_cycle_deferred = 0;
   g_backup_busy = 0;
   if(!g_start_notified) {
     notify("Backup utility started");
@@ -2209,7 +2142,7 @@ run_cycle(void) {
     backup_entry(line, &stats);
   }
   if(g_ps4saves || g_ps5saves) backup_saves(&stats);
-  if(g_daily > 0) {
+  if(!g_pending_only && g_daily > 0) {
     clock_info_t ci;
     char final[PATH_MAX];
     struct stat st;
@@ -2234,42 +2167,38 @@ run_cycle(void) {
 
   fclose(f);
 
+  pending_disable();
+  if(g_pending_only) {
+    for(pending_title_t *p = pending_titles; p; p = p->next)
+      if(p->ready) p->retry_at = now_seconds() + g_interval;
+  }
   if(g_ps4saves || g_ps5saves) {
     backup_saves(&stats);
   }
 
   /* Regular files have already been processed. A deferred save-image pass
    * must not prevent a snapshot of the available live backup. */
-  daily_check();
+  index_save();
+  if(!g_pending_only) daily_check();
   progress_stop();
 
-  if(g_game_abort) {
-    /* announce once per game session, not every 10 minutes */
-    if(!g_game_notified) {
-      logq("PS4/PS5 saves backup postponed: %s", g_abort_why);
-      notify("Save backup postponed.");
-      g_game_notified = 1;
-    } else {
-      logq("PS4/PS5 saves backup postponed: %s", g_abort_why);
-    }
-  } else {
-    g_game_notified = 0;
-  }
 
   if(stats.failed) {
-    /* announce only on the first failed cycle, not every 10 minutes */
+    /* announce only on the first failed cycle until recovery */
     if(!g_last_failed) {
       logq("Failed to backup (%u file(s) failed, %u copied)",
            stats.failed, stats.copied);
       notify("Backup incomplete (%u failed).", stats.failed);
     }
     g_last_failed = 1;
-  } else if(stats.copied || (g_last_failed && !g_game_abort)) {
+  } else if(stats.copied || (g_last_failed && !g_cycle_deferred)) {
     format_size(stats.bytes, size, sizeof size);
     logq("Successful backup (%s) done in %.1f seconds.", size,
          now_seconds() - start);
     notify("Backup complete (%s).", size);
     g_last_failed = 0;
+  } else if(g_cycle_deferred) {
+    logq("Backup pass finished; protected titles queued (%u files unchanged)", stats.unchanged);
   } else {
     logq("Backup up to date (%u files unchanged)", stats.unchanged);
   }
@@ -2326,31 +2255,22 @@ acquire_lock(void) {
 
 
 /**
- * Sleep until the next backup is due. Wakes up in short slices and compares
- * wall-clock time, so that after rest mode the next pass happens soon after
- * the console wakes up. Returns non-zero if another instance asked us to quit.
+ * Wait on monotonic interval deadlines, with short checks for closed queued
+ * titles. A close retry does not reset the next regular backup deadline.
  **/
+/* 0 = regular deadline, 1 = replacement requested, 2 = queued title closed. */
 static int
-wait_until(time_t due, int lock) {
+wait_until(double due, int lock) {
   for(;;) {
-    time_t now = wall_clock();
-    struct pollfd pfd;
-    int ms;
-
-    if(now >= due) {
-      return 0;
-    }
-
-    ms = (due - now > SLICE_SEC ? SLICE_SEC : (int)(due - now)) * 1000;
-    pfd.fd = lock;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-
+    double remaining = due - now_seconds();
+    if(remaining <= 0) return 0;
+    int slice = pending_titles ? CLOSE_POLL_SEC : SLICE_SEC;
+    if(pending_ready()) return 2;
+    int ms = remaining > slice ? slice * 1000 : (int)(remaining * 1000) + 1;
+    struct pollfd pfd = {lock, POLLIN, 0};
     if(poll(&pfd, lock >= 0 ? 1 : 0, ms) > 0 && (pfd.revents & POLLIN)) {
       int c = accept(lock, 0, 0);
-      if(c >= 0) {
-        close(c);
-      }
+      if(c >= 0) close(c);
       return 1;
     }
   }
@@ -2361,7 +2281,7 @@ int
 main(void) {
   int missing = 0;
   int lock;
-  time_t due;
+  double due, started;
 #ifdef BACKUP_HOST_TEST
   int cycles = 1;
   const char *max_cycles = getenv("TEST_CYCLES");
@@ -2372,14 +2292,19 @@ main(void) {
 
   kernel_set_proc_rootdir(getpid(), kernel_get_root_vnode());
   lock = acquire_lock();
+  if(lock < 0) {
+    notify("Backup could not start: instance lock unavailable.");
+    return EXIT_FAILURE;
+  }
 
   if(!(g_buf = malloc(COPY_BUF_SZ))) {
     notify("Backup could not start: not enough memory.");
     return EXIT_FAILURE;
   }
 
-  /* first pass right away: same behaviour as the one-shot version */
-  if(run_cycle() < 0) {
+  /* Initial backup immediately; subsequent regular deadlines use monotonic time. */
+  started = now_seconds();
+  if(run_cycle(0) < 0) {
     notify("backup.conf not found on USB.");
     return EXIT_FAILURE;
   }
@@ -2396,7 +2321,7 @@ main(void) {
     notify("Daily snapshots enabled (%d kept).", g_daily);
   }
 
-  due = next_due();
+  due = next_due(started);
 
   for(;;) {
 #ifdef BACKUP_HOST_TEST
@@ -2404,18 +2329,21 @@ main(void) {
       return EXIT_SUCCESS;
     }
 #endif
-    if(wait_until(due, lock)) {
+    int wake = wait_until(due, lock);
+    if(wake == 1) {
       notify("Previous backup instance stopped.");
       break;
     }
 
-    if(run_cycle() < 0) {
+    started = now_seconds();
+    if(run_cycle(wake == 2) < 0) {
       /* USB drive may still be mounting after rest mode: retry shortly and
        * only complain if it stays missing */
       if(++missing == MISSING_TRIES) {
         notify("backup.conf not found on USB.");
       }
-      due = wall_clock() + SLICE_SEC * 3;
+      pending_retry_after = now_seconds() + SLICE_SEC * 3;
+      due = pending_retry_after;
       continue;
     }
 #ifdef BACKUP_HOST_TEST
@@ -2426,9 +2354,10 @@ main(void) {
       logq("backup.conf is back");
     }
     missing = 0;
+    pending_retry_after = 0;
 
     /* g_interval may have been changed by the conf file */
-    due = next_due();
+    if(wake != 2) due = next_due(started);
   }
 
   return EXIT_SUCCESS;
