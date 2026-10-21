@@ -13,6 +13,8 @@ Easy to use USB save backup utility for jailbroken PS5s that helps you prevent d
 - Plug in into your PS5
 - Push the backup.elf payload to your PS5 using a network loader or an autoloader of your choice
 
+PS4/PS5 saves will not be backed up while in-game as mounting them can lead to corruption; a better solution will come in a later release 
+
 # Backup Configuration
 Example: 
 ```
@@ -46,6 +48,7 @@ daily_snapshots_to_keep=3
 # ProsperoEden
 /data/prosperoeden/user/nand
 ```
+
 
 ## Credits
 - n0llptr — [Playstation 5 Save Mounter](https://github.com/n0llptr/Playstation-5-Save-Mounter)
