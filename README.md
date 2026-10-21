@@ -22,16 +22,16 @@ Example:
 backup_interval_seconds=30
 
 # Enable decrypted PS4 save backups (false, true)
-backup_ps4_saves=false
+backup_ps4_saves=true
 
 # Enable decrypted PS5 save backups (false, true)
-backup_ps5_saves=false
+backup_ps5_saves=true
 
 # Maximum combined save-image size per title in MB (int)
 max_title_size_mb=4096
 
 # Number of dated snapshots retained, values 0 thru 10 are valid; 0 means disabled (int)
-daily_snapshots_to_keep=3
+daily_snapshots_to_keep=2
 
 # File backup section with most popular emulators listed
 
