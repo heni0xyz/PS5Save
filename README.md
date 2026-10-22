@@ -47,6 +47,9 @@ daily_snapshots_to_keep=2
 
 # ProsperoEden
 /data/prosperoeden/user/nand
+
+# PS5X360
+/data/homebrew/PPSA50011/saves
 ```
 
 
