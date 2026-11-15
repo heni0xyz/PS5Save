@@ -1,4 +1,4 @@
-<img width="128" height="128" alt="PS5Save" src="https://github.com/user-attachments/assets/dbdbdd48-14d2-46fa-8a6f-189ede65da7b" /> 
+<img width="128" height="128" alt="PS5Save" src="notification.png" />
 
 # PS5Save - Automatic game save and file backups!
 Easy to use USB save backup utility for jailbroken PS5s that helps you prevent data loss!  
@@ -27,6 +27,13 @@ backup_ps4_saves=true
 # Enable decrypted PS5 save backups (false, true)
 backup_ps5_saves=true
 
+# Copy original encrypted PS4 and PS5 saves, including PS4 companion keys
+backup_encrypted_saves=false
+
+# Copy PS4 and PS5 trophy progress and catalogs to USB
+backup_ps4_trophies=false
+backup_ps5_trophies=false
+
 # Maximum combined save-image size per title in MB (int)
 max_title_size_mb=4096
 
@@ -52,6 +59,11 @@ daily_snapshots_to_keep=2
 /data/homebrew/PPSA50011/saves
 ```
 
+Encrypted saves and trophies default to off. Each setting works independently of decrypted save backups.
+
+- Encrypted PS4 and PS5 saves keep their original filenames and directory structure under `/backup/user/home/<USER_ID>/savedata/` and `/backup/user/home/<USER_ID>/savedata_prospero/` on the USB. These copies include PS4 `.bin` companion files. The decrypted per-title size limit does not apply to these copies.
+- Trophy backups copy the per-user `trophy` and `trophy2` directories and the shared catalogs under `/user/trophy` and `/user/trophy2` when present. The USB copies preserve those paths under `/backup`.
+- These options copy files individually on regular backup passes. For a consistent copy of a game's save and trophy files, close the game before running a pass.
 
 ## Credits
 - n0llptr — [Playstation 5 Save Mounter](https://github.com/n0llptr/Playstation-5-Save-Mounter)
@@ -72,7 +84,7 @@ sudo apt install make clang-18 lld-18 llvm-18 wget unzip
 Download and extract the SDK
 
 ```sh
-wget https://github.com/ps5-payload-dev/sdk/releases/download/v0.44/ps5-payload-sdk.zip
+wget https://github.com/ps5-payload-dev/sdk/releases/download/v0.45/ps5-payload-sdk.zip
 unzip ps5-payload-sdk.zip
 export PS5_PAYLOAD_SDK="$(pwd)/ps5-payload-sdk"
 export LLVM_CONFIG=llvm-config-18

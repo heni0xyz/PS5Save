@@ -25,6 +25,9 @@ along with this program; see the file COPYING. If not, see
  *   backup_interval_seconds=60      seconds between backups (default 60)
  *   backup_ps4_saves=true           enable decrypted PS4 saves (default false)
  *   backup_ps5_saves=true           enable decrypted PS5 saves (default false)
+ *   backup_encrypted_saves=true     copy original PS4 and PS5 save files
+ *   backup_ps4_trophies=true        copy PS4 trophy data and catalogs
+ *   backup_ps5_trophies=true        copy PS5 trophy data and catalogs
  *   max_title_size_mb=4096          size limit for all save images of one title
  *                                  in decimal MB; default 4096 = 4.096GB
  *   daily_snapshots_to_keep=3       keep a dated snapshot (a copy of the live
@@ -162,9 +165,10 @@ int sceNotificationSend(int user_id, bool is_logged, const char *payload);
 #ifndef NOTIFICATION_ICON_DIR
 #define NOTIFICATION_ICON_DIR "/user/data/ps5save"
 #endif
-#define NOTIFICATION_ICON_PATH NOTIFICATION_ICON_DIR "/notification.png"
+#define PS5SAVE_RELEASE "v3"
+#define NOTIFICATION_ICON_PATH NOTIFICATION_ICON_DIR "/notification-" PS5SAVE_RELEASE ".png"
 
-static const char PS5SAVE_VERSION[] = "v2";
+static const char PS5SAVE_VERSION[] = PS5SAVE_RELEASE;
 
 static int mkdir_p(const char *path);
 
@@ -269,6 +273,9 @@ static uint64_t g_file_cap = MAX_FILE_SZ;   /* per-file limit, 0 = none */
 static int g_daily = 0;                     /* daily_snapshots_to_keep=N, 0 = off */
 static int g_ps4saves = 0;
 static int g_ps5saves = 0;
+static int g_encrypted_saves = 0;
+static int g_ps4trophies = 0;
+static int g_ps5trophies = 0;
 static int g_need_cleanup = 1;
 static int g_mount_stuck = 0;
 static int g_watch_game = 0;      /* protect the currently mounted title */
@@ -1537,43 +1544,93 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
 }
 
 
-/**
- * Back up decrypted PS4/PS5 saves for every user, as enabled in backup.conf.
- **/
+/* Copy an optional console directory, keeping its original path on USB. */
+static void
+backup_console_dir(const char *src, backup_stats_t *stats) {
+  char dst[PATH_MAX];
+  struct stat st;
+
+  if(lstat(src, &st)) {
+    if(errno != ENOENT) {
+      logq("Failed to read %s", src);
+      stats->failed++;
+    }
+    return;
+  }
+  if(!S_ISDIR(st.st_mode) || is_backup_root(&st)) return;
+  if(snprintf(dst, sizeof dst, "%s%s", BACKUP_ROOT, src) >= (int)sizeof dst) {
+    stats->failed++;
+    return;
+  }
+  backup_tree(src, dst, stats);
+}
+
+
+/* Back up the selected console save and trophy data for every local user. */
 static void
 backup_saves(backup_stats_t *stats) {
   priv_state_t old;
   struct dirent *ud;
   DIR *hd;
+  int decrypted = g_ps4saves || g_ps5saves;
+  int direct = !g_pending_only &&
+               (g_encrypted_saves || g_ps4trophies || g_ps5trophies);
 
+  if(!decrypted && !direct) return;
   priv_elevate(&old);
 
-  if(!g_progress_planning && (g_need_cleanup || g_mount_stuck)) {
+  if(decrypted && !g_progress_planning && (g_need_cleanup || g_mount_stuck)) {
     cleanup_stale();
     g_need_cleanup = 0;
   }
-  if(g_mount_stuck) {
-    logq("A previous save mount could not be removed; saves backup disabled");
+  if(decrypted && g_mount_stuck) {
+    logq("A previous save mount could not be removed; decrypted saves backup disabled");
     stats->failed++;
-    priv_restore(&old);
-    return;
   }
 
   if((hd = opendir(HOME_ROOT))) {
-    while((ud = readdir(hd)) && !g_mount_stuck) {
+    while((ud = readdir(hd))) {
+      struct stat st;
+      char path[PATH_MAX];
+
       if(!is_hex_name(ud->d_name)) {
         continue;
       }
-      if(g_ps4saves) {
+      snprintf(path, sizeof path, "%s/%s", HOME_ROOT, ud->d_name);
+      if(lstat(path, &st) || !S_ISDIR(st.st_mode)) continue;
+
+      if(g_ps4saves && !g_mount_stuck) {
         scan_saves(ud->d_name, 0, stats);
       }
       if(g_ps5saves && !g_mount_stuck) {
         scan_saves(ud->d_name, 1, stats);
       }
+      if(direct && g_encrypted_saves) {
+        uint64_t file_cap = g_file_cap;
+        g_file_cap = 0;  /* Encrypted images can be larger than ordinary files. */
+        snprintf(path, sizeof path, "%s/%s/savedata", HOME_ROOT, ud->d_name);
+        backup_console_dir(path, stats);
+        snprintf(path, sizeof path, "%s/%s/savedata_prospero", HOME_ROOT, ud->d_name);
+        backup_console_dir(path, stats);
+        g_file_cap = file_cap;
+      }
+      if(direct && g_ps4trophies) {
+        snprintf(path, sizeof path, "%s/%s/trophy", HOME_ROOT, ud->d_name);
+        backup_console_dir(path, stats);
+      }
+      if(direct && g_ps5trophies) {
+        snprintf(path, sizeof path, "%s/%s/trophy2", HOME_ROOT, ud->d_name);
+        backup_console_dir(path, stats);
+      }
     }
     closedir(hd);
+  } else {
+    logq("Failed to open %s", HOME_ROOT);
+    stats->failed++;
   }
 
+  if(direct && g_ps4trophies) backup_console_dir("/user/trophy", stats);
+  if(direct && g_ps5trophies) backup_console_dir("/user/trophy2", stats);
   g_watch_game = 0;
   priv_restore(&old);
 }
@@ -1588,6 +1645,7 @@ static const char *
 config_value(const char *line, const char *key, const char *legacy) {
   const char *names[2] = {key, legacy};
   for(int i = 0; i < 2; i++) {
+    if(!names[i]) continue;
     size_t n = strlen(names[i]);
     if(strncmp(line, names[i], n)) {
       continue;
@@ -1677,6 +1735,18 @@ backup_entry(char *line, backup_stats_t *stats) {
     parse_bool(value, &g_ps5saves);
     return;
   }
+  if((value = config_value(line, "backup_encrypted_saves", NULL))) {
+    parse_bool(value, &g_encrypted_saves);
+    return;
+  }
+  if((value = config_value(line, "backup_ps4_trophies", NULL))) {
+    parse_bool(value, &g_ps4trophies);
+    return;
+  }
+  if((value = config_value(line, "backup_ps5_trophies", NULL))) {
+    parse_bool(value, &g_ps5trophies);
+    return;
+  }
 
   if(g_pending_only) return;
 
@@ -1714,6 +1784,20 @@ backup_entry(char *line, backup_stats_t *stats) {
   struct stat root;
   if(!stat("/", &root) && root.st_dev == st.st_dev && root.st_ino == st.st_ino) {
     logq("Refusing to back up the filesystem root: %s", line);
+    stats->failed++;
+    return;
+  }
+
+  /* The source path is appended to BACKUP_ROOT to form the destination. */
+  for(const char *part = strstr(line, "/.."); part; part = strstr(part + 3, "/..")) {
+    if(part[3] == '/' || part[3] == 0) {
+      logq("Refusing to back up a path with a parent directory component: %s", line);
+      stats->failed++;
+      return;
+    }
+  }
+  if(S_ISDIR(st.st_mode) && is_backup_root(&st)) {
+    logq("Refusing to back up the backup destination: %s", line);
     stats->failed++;
     return;
   }
@@ -2164,6 +2248,7 @@ run_cycle(int pending_only) {
   g_daily = 0;
   g_ps4saves = 0;
   g_ps5saves = 0;
+  g_encrypted_saves = g_ps4trophies = g_ps5trophies = 0;
   g_game_abort = 0;
   g_watch_game = 0;
 
@@ -2171,7 +2256,7 @@ run_cycle(int pending_only) {
   while(fgets(line, sizeof line, f)) {
     backup_entry(line, &stats);
   }
-  if(g_ps4saves || g_ps5saves) backup_saves(&stats);
+  backup_saves(&stats);
   if(!g_pending_only && g_daily > 0) {
     clock_info_t ci;
     char final[PATH_MAX];
@@ -2191,6 +2276,7 @@ run_cycle(int pending_only) {
   g_interval = DEF_INTERVAL;
   g_max_game = DEF_GAME_MB * BYTES_PER_MB;
   g_daily = g_ps4saves = g_ps5saves = 0;
+  g_encrypted_saves = g_ps4trophies = g_ps5trophies = 0;
   while(fgets(line, sizeof line, f)) {
     backup_entry(line, &stats);
   }
@@ -2202,9 +2288,7 @@ run_cycle(int pending_only) {
     for(pending_title_t *p = pending_titles; p; p = p->next)
       if(p->ready) p->retry_at = now_seconds() + g_interval;
   }
-  if(g_ps4saves || g_ps5saves) {
-    backup_saves(&stats);
-  }
+  backup_saves(&stats);
 
   /* Regular files have already been processed. A deferred save-image pass
    * must not prevent a snapshot of the available live backup. */
