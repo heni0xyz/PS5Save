@@ -1086,19 +1086,29 @@ cleanup_stale(void) {
 }
 
 
+static void stamp_write(const char *dst_dir, const struct stat *img);
+
 static int
-stamp_current(const char *dst_dir, const struct stat *img) {
+stamp_current(const char *dst_dir, const struct stat *img, int count) {
   char path[PATH_MAX];
   file_signature_t stored, current = file_signature(img);
+  int counting = count && !g_progress_planning;
   snprintf(path, sizeof path, "%s/.image_stamp", dst_dir);
   FILE *f = fopen(path, "rb");
-  if(!f) return 0;
+  if(!f) {if(counting) recopy.no_record++; return 0;}
   char magic[8];
   int ok = fread(magic, 1, 8, f) == 8 && !memcmp(magic, "PS5IMG2\n", 8) &&
-           fread(&stored, 1, sizeof stored, f) == sizeof stored &&
-           !memcmp(&stored, &current, sizeof stored);
+           fread(&stored, 1, sizeof stored, f) == sizeof stored;
   fclose(f);
-  return ok;
+  if(!ok) {if(counting) recopy.no_record++; return 0;}
+  if(!sig_same_content(&stored, &current)) {
+    if(counting) recopy_reason(&stored, &current);
+    return 0;
+  }
+  /* refresh once so the same drift is not reported on every pass */
+  if(counting && drift_note(dst_dir, &stored, &current, NULL, NULL))
+    stamp_write(dst_dir, img);
+  return 1;
 }
 
 static void
@@ -1156,7 +1166,7 @@ backup_save_image(const char *uid, const char *title, const char *tdir,
   }
 
   /* nothing new since the last backup: no need to mount anything */
-  if(stamp_current(dst_dir, &ist)) {
+  if(stamp_current(dst_dir, &ist, 0)) {
     stats->unchanged++;
     return SV_SKIP;
   }
@@ -1437,7 +1447,7 @@ scan_saves(const char *uid, int ps5, backup_stats_t *stats) {
 
       snprintf(imgs[n].name, sizeof imgs[n].name, "%s", ie->d_name);
       imgs[n].size = st.st_size;
-      imgs[n].needed = !stamp_current(dst_dir, &st);
+      imgs[n].needed = !stamp_current(dst_dir, &st, 1);
       total += st.st_size;
       if(imgs[n].needed) {
         needed++;
